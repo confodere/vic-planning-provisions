@@ -1,9 +1,14 @@
+from datetime import timedelta
 import requests
+import requests_cache
 import json
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString
 from jinja2 import Environment, PackageLoader, select_autoescape
 from docxtpl import DocxTemplate
+from mailmerge import MailMerge
+from docx import Document
+from docx.text.paragraph import Paragraph
 
 
 class Planning:
@@ -12,12 +17,13 @@ class Planning:
     ordinance_url = "https://api.vicplanning.app/planning/v2/schemes/vpp/ordinances/"
 
     def __init__(self, clause_name, sub_clause_name):
+        self.session = requests_cache.CachedSession("schemes", expire_after=timedelta(days=7))
         self.index_json = self.getUrl(self.index_url)
         self.clause_name = clause_name
         self.sub_clause_name = sub_clause_name
 
     def getUrl(self, url):
-        return json.loads(requests.get(url).text)
+        return json.loads(self.session.get(url).text)
 
     def getOrdinanceID(self):
         for clause in self.index_json["clauses"]:
@@ -151,7 +157,7 @@ class Planning:
                 if point.name == "li":
                     sub_points = self._parse_children(point)
                     if sub_points:
-                        points.append(sub_points)
+                        points.append({"li": sub_points})
             return {"ul": points}
         elif elem.name == "table":
             table = {"header": [], "body": []}
@@ -189,7 +195,7 @@ class Planning:
         current_rule = {"content": []}
         for child in soup.children:
             if child.name == "h3":
-                if len(current_rule) > 1:
+                if len(current_rule["content"]) > 0:
                     rules.append(current_rule)
                     current_rule = {"content": []}
                 current_rule["title"] = child.get_text()
@@ -207,10 +213,90 @@ class Planning:
             print("Failed to find rule")
 
 
-def docx(content):
+def docx_tpl(content):
     doc = DocxTemplate("App/templates/template.docx")
     doc.render(content)
     doc.save("output.docx")
+
+
+def docx(content):
+    doc = Document()
+
+    for name, division in content.items():
+        doc.add_heading(name, level=2)
+        for section in division:
+            if "title" in section.keys():
+                doc.add_heading(section["title"], level=3)
+            for content in section["content"]:
+                doc = parse_elem(doc, content)
+
+    doc.save("test.docx")
+
+
+def get_text(obj):
+    if type(obj) is list:
+        items = []
+        for item in obj:
+            items.append(get_text(item))
+        return " ".join(items)
+    else:
+        items = []
+        for item in obj:
+            if item == "p":
+                items.append(obj[item])
+            elif item == "ul" or item == "li":
+                items.append(get_text(obj[item]))
+            elif item == "table":
+                print("Table inside list")
+        return " ".join(items)
+
+
+def cycle_elem(doc, obj, indent=0, paragraph=None):
+    if type(obj) is list:
+        cycle_elem(doc, obj[0], indent, paragraph)
+        for item in obj[1:]:
+            cycle_elem(doc, item, indent=indent)
+    else:
+        parse_elem(doc, obj, indent, paragraph)
+
+
+def parse_elem(doc, obj, indent=0, paragraph=None):
+    if "p" in obj.keys():
+        if paragraph is not None:
+            paragraph.add_run(obj["p"])
+        else:
+            doc.add_paragraph(obj["p"])
+    elif "ul" in obj.keys():
+        for elem in obj["ul"]:
+            doc = parse_elem(doc, elem, indent)
+    elif "li" in obj.keys():
+        styles = ["List Bullet", "List Bullet 2", "List Bullet 3"]
+        if indent >= len(styles):
+            print(f"Indent level {indent} not supported")
+            style = styles[-1]
+        else:
+            style = styles[indent]
+
+        paragraph = doc.add_paragraph("", style=style)
+        cycle_elem(doc, obj["li"], indent=indent + 1, paragraph=paragraph)
+    elif "table" in obj.keys():
+        if "caption" in obj["table"].keys():
+            doc.add_heading(obj["table"]["caption"], level=4)
+        row_num, col_num = len(obj["table"]["body"]) + 1, len(obj["table"]["header"])
+        table = doc.add_table(rows=row_num, cols=col_num)
+        for row in range(row_num):
+            for cell in range(col_num):
+                if row == 0:
+                    table.rows[row].cells[cell].text = get_text(obj["table"]["header"][cell])
+                else:
+                    if len(obj["table"]["body"]) > row - 1 and len(obj["table"]["body"][row - 1]) > cell:
+                        paragraph = table.rows[row].cells[cell].paragraphs[0]
+                        cycle_elem(table.rows[row].cells[cell], obj["table"]["body"][row - 1][cell], indent, paragraph)
+        table.style = "LightShading-Accent1"
+
+        # print(obj["table"])
+
+    return doc
 
 
 def md(content):
@@ -227,9 +313,13 @@ if __name__ == "__main__":
     # with open("dump2.json", "w") as f:
     #    json.dump(planning.renderOrdinance(), f)
 
-    # planning.parseOrdinance()
+    planning.parseOrdinance()
     # print(json.dumps(planning.ordinance_sections))
+    docx(planning.ordinance_sections)
 
-    content = {"subdivisions": planning.renderOrdinance()}
+    # content = {"subdivisions": planning.renderOrdinance()}
 
-    md(content)
+    # with MailMerge("planning_report.docx") as doc:
+    #    print(doc.get_merge_fields())
+
+    # md(content)
